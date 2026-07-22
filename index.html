@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="description" content="Centre Court — a browser tennis simulation with real ball physics, four surfaces, online play and a full practice academy.">
+<meta name="theme-color" content="#050a10">
+<title>Centre Court — Tennis</title>
+<link rel="stylesheet" href="css/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='16' cy='16' r='14' fill='%23d8ec3a'/><path d='M4 9a16 16 0 0 1 0 14M28 9a16 16 0 0 0 0 14' stroke='%23fff' stroke-width='2' fill='none'/></svg>">
+</head>
+<body>
+
+<canvas id="court" aria-label="Tennis court" role="img"></canvas>
+
+<div id="overlay" class="hidden" role="dialog" aria-label="Game menu"></div>
+
+<noscript>
+  <div class="noscript">
+    <h1>Centre Court</h1>
+    <p>This game needs JavaScript enabled.</p>
+  </div>
+</noscript>
+
+<script type="module" src="js/main.js"></script>
+</body>
+</html>
