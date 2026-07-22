@@ -232,7 +232,269 @@ function tint(color, shadeIdx, fadeStep, haze) {
 // Live palette for the figure being drawn (avoids threading 12 args everywhere).
 let _fadeStep = 0;
 let _haze = '#8fa6bd';
+let _hzR = 0x8f, _hzG = 0xa6, _hzB = 0xbd;   // haze split into channels for gradients
 const col = (c, s) => tint(c, s, _fadeStep, _haze);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Lighting model + volumetric shading.
+//
+// All shading is done on the already-flattened screen-space primitives, so the
+// key light is expressed as a SCREEN direction (screen y points DOWN). That makes
+// a top-down floodlight invariant to the player's facing — exactly right — while
+// the torso/chest highlight still slides as the player turns, because it keys off
+// the projected shoulder axis, which rotates.
+//
+// The single trick that buys most of the "3D" is a gradient laid PERPENDICULAR to
+// each limb axis: rim/terminator/mid/highlight/lit-edge. Gradients are cached by
+// (colour, shade, light-perp bucket, radius tier, haze step, light signature) and
+// reused via a per-limb orthonormal ctx.transform, so the hot path allocates
+// nothing after warm-up.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const _L = {
+  dx: -0.34, dy: -0.94,     // key direction in screen space (toward the light)
+  exposure: 1.0,            // overall exposure (venue.ambientLight)
+  keyTint: 0xffffff, keyTintAmt: 0.06,
+  rim: 0.45, rimTint: 0xdfe8f5,
+  ao: 0.9,                  // AO / contact strength (from shadowAlpha)
+  bounce: 0x2a2620, bounceAmt: 0.12,
+  sig: 0,
+};
+
+// Radius tiers for the limb-gradient cache. A limb's true radius snaps to the
+// nearest tier; the gradient is built spanning that tier so the highlight band
+// lands in roughly the right place without a per-radius allocation.
+const R_TIERS = [1.5, 2.2, 3, 4, 5.5, 7.5, 10, 13.5, 18, 24, 32, 44];
+function rTier(R) {
+  let best = 0, bd = 1e9;
+  for (let i = 0; i < R_TIERS.length; i++) {
+    const d = Math.abs(R_TIERS[i] - R);
+    if (d < bd) { bd = d; best = i; }
+  }
+  return best;
+}
+
+const _gradCache = new Map();
+
+/** Derive the screen-space light rig from a venue (null → neutral studio). */
+function deriveLight(venue) {
+  let dx = -0.34, dy = -0.94, exposure = 1.0;
+  let keyTint = 0xffffff, keyTintAmt = 0.06, rim = 0.42, rimTint = 0xdfe8f5;
+  let ao = 0.85, bounce = 0x2a2620, bounceAmt = 0.12;
+
+  if (venue) {
+    const amb = venue.ambientLight != null ? venue.ambientLight : 1.0;
+    exposure = clamp(amb, 0.6, 1.4);
+    ao = clamp((venue.shadowAlpha != null ? venue.shadowAlpha : 0.3) * 1.7, 0.12, 1.0);
+    const tod = venue.timeOfDay;
+    const trim = venue.stadium && venue.stadium.wallTrim;
+
+    if (venue.floodlit) {
+      dx = -0.28; dy = -0.96;                  // steep top-down key
+      if (venue.indoor) {
+        rim = 0.95; rimTint = parseHex(trim || '#00c8ff');
+        keyTint = 0xeef6ff; keyTintAmt = 0.11; bounce = 0x101a2a; bounceAmt = 0.10;
+      } else {
+        rim = 0.85; rimTint = 0xeaf2ff;
+        keyTint = 0xffffff; keyTintAmt = 0.09; bounce = 0x142442; bounceAmt = 0.10;
+      }
+    } else if (tod === 'afternoon') {
+      dx = -0.64; dy = -0.58;                   // low, raking, warm
+      keyTint = 0xfff0d6; keyTintAmt = 0.17;
+      rim = (venue.shadowAlpha != null && venue.shadowAlpha < 0.2) ? 0.15 : 0.5;  // London overcast → almost none
+      rimTint = 0xfff2dc;
+    } else {                                    // 'day' / harsh sun
+      dx = -0.33; dy = -0.86;
+      keyTint = 0xfff4e0; keyTintAmt = 0.15; rim = 0.55; rimTint = 0xfff2e0;
+    }
+
+    const surf = venue.surface || '';
+    if (surf === 'clay') { bounce = 0xc1683a; bounceAmt = 0.20; }
+    else if (surf === 'grass') { bounce = 0x3f6b3a; bounceAmt = 0.13; }
+    else if (surf === 'indoor') { bounce = 0x121e2c; bounceAmt = 0.10; }
+  }
+
+  const m = Math.hypot(dx, dy) || 1;
+  _L.dx = dx / m; _L.dy = dy / m;
+  _L.exposure = exposure;
+  _L.keyTint = keyTint; _L.keyTintAmt = keyTintAmt;
+  _L.rim = rim; _L.rimTint = rimTint;
+  _L.ao = ao; _L.bounce = bounce; _L.bounceAmt = bounceAmt;
+  // Signature so the gradient cache never returns a colour built for another rig.
+  _L.sig = ((exposure * 20) | 0) * 131 + ((rim * 20) | 0) * 17
+    + (keyTint & 0xff) + ((rimTint & 0xff) << 3) + (bounce & 0xff)
+    + ((_L.dx * 15) | 0) * 3 + ((_L.dy * 15) | 0);
+}
+
+/**
+ * Add the five cylindrical stops to a gradient whose parameter runs from the
+ * -perp silhouette edge (position 0) to the +perp edge (position 1). `s` is the
+ * light projected onto that perpendicular axis, in [-1, 1].
+ */
+function addCylStops(g, baseInt, shadeIdx, s) {
+  const sgn = s < 0 ? -1 : 1;
+  const a = Math.min(1, Math.abs(s));
+  const exp = _L.exposure;
+
+  let br = (baseInt >> 16) & 255, bg = (baseInt >> 8) & 255, bb = baseInt & 255;
+  if (shadeIdx === 1) {                         // far limb: desaturate + darken
+    const lum = br * 0.3 + bg * 0.59 + bb * 0.11;
+    br = lerp(br, lum, 0.16) * 0.86;
+    bg = lerp(bg, lum, 0.16) * 0.86;
+    bb = lerp(bb, lum, 0.16) * 0.86;
+  }
+  const peak = 0.24 + 0.36 * a;
+  const fadeT = _fadeStep > 0 ? _fadeStep / FADE_STEPS : 0;
+
+  const put = (w, k, addC, addA) => {
+    let r = br * k * exp, gg = bg * k * exp, b = bb * k * exp;
+    if (addC >= 0) {
+      r = lerp(r, (addC >> 16) & 255, addA);
+      gg = lerp(gg, (addC >> 8) & 255, addA);
+      b = lerp(b, addC & 255, addA);
+    }
+    if (fadeT > 0) { r = lerp(r, _hzR, fadeT); gg = lerp(gg, _hzG, fadeT); b = lerp(b, _hzB, fadeT); }
+    const pos = clamp((w * sgn + 1) * 0.5, 0, 1);
+    g.addColorStop(pos,
+      'rgb(' + (r > 255 ? 255 : r < 0 ? 0 : r | 0) + ',' +
+      (gg > 255 ? 255 : gg < 0 ? 0 : gg | 0) + ',' +
+      (b > 255 ? 255 : b < 0 ? 0 : b | 0) + ')');
+  };
+
+  const rimK = 0.42 + 0.55 * _L.rim;
+  const rimA = 0.16 + 0.5 * _L.rim;
+  put(-1.0, rimK, _L.rimTint, rimA);            // back/rim light on the shadow edge
+  put(-0.5, 0.42, _L.bounce, _L.bounceAmt);     // terminator core + warm court bounce
+  put(0.0, 0.72, -1, 0);
+  put(peak, 1.05, _L.keyTint, _L.keyTintAmt);   // key highlight
+  put(1.0, 0.9, -1, 0);                         // lit edge, curvature falloff
+}
+
+/** Cached perpendicular gradient for a limb, in the local frame (x = perp). */
+function limbGrad(ctx, baseColor, shadeIdx, s, R) {
+  const sBucket = Math.round(clamp(s, -1, 1) * 4);
+  const rt = rTier(R);
+  const key = baseColor + '|' + shadeIdx + '|' + sBucket + '|' + rt + '|' + _fadeStep + '|' + _L.sig;
+  let g = _gradCache.get(key);
+  if (g !== undefined) return g;
+
+  const Rb = R_TIERS[rt];
+  g = ctx.createLinearGradient(-Rb, 0, Rb, 0);
+  addCylStops(g, parseHex(baseColor), shadeIdx, sBucket / 4);
+  if (_gradCache.size > 4000) _gradCache.clear();
+  _gradCache.set(key, g);
+  return g;
+}
+
+/**
+ * Draw a tapered capsule with cylindrical shading. Silhouette is identical to
+ * taper(); the fill is a cached perpendicular gradient positioned by an
+ * orthonormal transform (det = -1, never degenerate for a real limb).
+ */
+function litTaper(ctx, ax, ay, ra, bx, by, rb, baseColor, shadeIdx) {
+  if (!(isFinite(ax) && isFinite(ay) && isFinite(bx) && isFinite(by))) return;
+  const dx = bx - ax, dy = by - ay;
+  const len = Math.sqrt(dx * dx + dy * dy);
+  const R = Math.max(ra, rb);
+  if (!(len > 1e-3)) { litDisc(ctx, ax, ay, R, baseColor, shadeIdx); return; }
+
+  const ux = dx / len, uy = dy / len;           // axis
+  const px = -uy, py = ux;                       // perpendicular (screen)
+  const s = _L.dx * px + _L.dy * py;
+  const g = limbGrad(ctx, baseColor, shadeIdx, s, R);
+
+  ctx.save();
+  try {
+    // local x → perp, local y → axis. Orthonormal, |det| = 1.
+    ctx.transform(px, py, ux, uy, ax, ay);
+    taperPath(ctx, 0, 0, ra, 0, len, rb);
+    ctx.fillStyle = g;
+    ctx.fill();
+  } finally {
+    ctx.restore();
+  }
+}
+
+/** Cached spherical (radial) gradient with the highlight offset toward the light. */
+function sphereGrad(ctx, baseColor, shadeIdx, R) {
+  const rt = rTier(R);
+  const key = 'S|' + baseColor + '|' + shadeIdx + '|' + rt + '|' + _fadeStep + '|' + _L.sig;
+  let g = _gradCache.get(key);
+  if (g !== undefined) return g;
+
+  const Rb = R_TIERS[rt];
+  const hx = _L.dx * Rb * 0.42, hy = _L.dy * Rb * 0.42;
+  g = ctx.createRadialGradient(hx, hy, Rb * 0.04, 0, 0, Rb * 1.03);
+
+  let br = (parseHex(baseColor) >> 16) & 255, bg = (parseHex(baseColor) >> 8) & 255, bb = parseHex(baseColor) & 255;
+  if (shadeIdx === 1) { const l = br * 0.3 + bg * 0.59 + bb * 0.11; br = lerp(br, l, 0.16) * 0.86; bg = lerp(bg, l, 0.16) * 0.86; bb = lerp(bb, l, 0.16) * 0.86; }
+  const exp = _L.exposure;
+  const fadeT = _fadeStep > 0 ? _fadeStep / FADE_STEPS : 0;
+  const put = (pos, k, addC, addA) => {
+    let r = br * k * exp, gg = bg * k * exp, b = bb * k * exp;
+    if (addC >= 0) { r = lerp(r, (addC >> 16) & 255, addA); gg = lerp(gg, (addC >> 8) & 255, addA); b = lerp(b, addC & 255, addA); }
+    if (fadeT > 0) { r = lerp(r, _hzR, fadeT); gg = lerp(gg, _hzG, fadeT); b = lerp(b, _hzB, fadeT); }
+    g.addColorStop(pos, 'rgb(' + (r > 255 ? 255 : r | 0) + ',' + (gg > 255 ? 255 : gg | 0) + ',' + (b > 255 ? 255 : b | 0) + ')');
+  };
+  put(0.0, 1.08, _L.keyTint, _L.keyTintAmt);
+  put(0.45, 0.82, -1, 0);
+  put(0.82, 0.5, -1, 0);                         // terminator
+  put(1.0, 0.44 + 0.5 * _L.rim, _L.rimTint, 0.14 + 0.4 * _L.rim);   // rim
+  if (_gradCache.size > 4000) _gradCache.clear();
+  _gradCache.set(key, g);
+  return g;
+}
+
+function litDisc(ctx, cx, cy, R, baseColor, shadeIdx) {
+  if (!(isFinite(cx) && isFinite(cy) && R > 0.2)) {
+    if (isFinite(cx) && isFinite(cy) && R > 0) disc(ctx, cx, cy, R, col(baseColor, shadeIdx));
+    return;
+  }
+  const g = sphereGrad(ctx, baseColor, shadeIdx, R);
+  ctx.save();
+  try {
+    ctx.translate(cx, cy);
+    ctx.beginPath();
+    ctx.arc(0, 0, R, 0, TAU);
+    ctx.fillStyle = g;
+    ctx.fill();
+  } finally {
+    ctx.restore();
+  }
+}
+
+// Cached ambient-occlusion falloff (black → transparent), scaled per use.
+const AO_REF = 32;
+let _aoGrad = null;
+function aoGradient(ctx) {
+  if (_aoGrad) return _aoGrad;
+  const g = ctx.createRadialGradient(0, 0, 0, 0, 0, AO_REF);
+  g.addColorStop(0, 'rgba(0,0,0,1)');
+  g.addColorStop(0.55, 'rgba(0,0,0,0.55)');
+  g.addColorStop(1, 'rgba(0,0,0,0)');
+  _aoGrad = g;
+  return g;
+}
+
+/** Soft dark contact blob (limb-into-torso, under chin, hem, etc.). */
+function aoBlob(ctx, x, y, rx, ry, strength) {
+  if (!(isFinite(x) && isFinite(y) && rx > 0.3 && ry > 0.3)) return;
+  const a = clamp(strength * _L.ao, 0, 0.85);
+  if (a < 0.02) return;
+  const g = aoGradient(ctx);
+  ctx.save();
+  try {
+    ctx.globalAlpha = a;
+    ctx.translate(x, y);
+    ctx.scale(rx / AO_REF, ry / AO_REF);
+    ctx.beginPath();
+    ctx.arc(0, 0, AO_REF, 0, TAU);
+    ctx.fillStyle = g;
+    ctx.fill();
+  } finally {
+    ctx.restore();
+  }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Pose construction
@@ -756,13 +1018,12 @@ const depthOf = (j) => -(j.r * _dom) * _sf + j.f * _cf;
  * angle ± acos((ra-rb)/d) from the centre line, so the silhouette stays smooth
  * even when the two radii differ a lot (thigh → knee).
  */
-function taper(ctx, ax, ay, ra, bx, by, rb, fill) {
+function taperPath(ctx, ax, ay, ra, bx, by, rb) {
   const dx = bx - ax, dy = by - ay;
   const d = Math.sqrt(dx * dx + dy * dy);
   if (d < 1e-4) {
     ctx.beginPath();
     ctx.arc(ax, ay, Math.max(ra, rb), 0, TAU);
-    ctx.fillStyle = fill; ctx.fill();
     return;
   }
   const ang = Math.atan2(dy, dx);
@@ -771,6 +1032,10 @@ function taper(ctx, ax, ay, ra, bx, by, rb, fill) {
   ctx.arc(ax, ay, ra, ang + t, ang - t + TAU);
   ctx.arc(bx, by, rb, ang - t + TAU, ang + t + TAU);
   ctx.closePath();
+}
+
+function taper(ctx, ax, ay, ra, bx, by, rb, fill) {
+  taperPath(ctx, ax, ay, ra, bx, by, rb);
   ctx.fillStyle = fill;
   ctx.fill();
 }
@@ -803,6 +1068,7 @@ function disc(ctx, x, y, r, fill) {
 export function drawPlayer(ctx, camera, player, avatar, opts) {
   const ground = camera.projectGround(player.x, player.y);
   if (!ground.visible || ground.scale <= 0) return;
+  if (!(isFinite(ground.x) && isFinite(ground.y) && isFinite(ground.scale))) return;
 
   const scale = ground.scale;
   const figH = (avatar && avatar.height ? avatar.height : PLAYER.HEIGHT) * scale;
@@ -824,6 +1090,8 @@ export function drawPlayer(ctx, camera, player, avatar, opts) {
   let haze = (opts && opts.haze) || null;
   if (!haze && venue && venue.sky) haze = venue.sky[1] || venue.sky[0];
   if (!haze) haze = '#8fa6bd';
+
+  deriveLight(venue || (opts && opts.lighting) || null);
 
   _st.state = player.animState || 'idle';
   _st.phase = player.animPhase || 0;
@@ -855,7 +1123,7 @@ export function drawPlayer(ctx, camera, player, avatar, opts) {
  * @param opts  optional { fade, haze, alpha, tilt, lod }
  */
 export function drawPlayerFigure(ctx, x, y, scale, avatar, pose, opts) {
-  if (!(scale > 0)) return;
+  if (!(scale > 0) || !(isFinite(x) && isFinite(y))) return;
   let st;
   if (typeof pose === 'string') {
     _st.state = pose; _st.phase = 0; _st.facing = Math.PI;
@@ -868,6 +1136,7 @@ export function drawPlayerFigure(ctx, x, y, scale, avatar, pose, opts) {
     _st.stamina = 1; _st.vx = 0; _st.vy = 0; _st.swingType = 'forehand';
     st = _st;
   }
+  deriveLight((opts && (opts.venue || opts.lighting)) || null);
   drawFigure(ctx, x, y, scale, avatar, st,
     opts && opts.fade != null ? clamp(opts.fade, 0, 1) : 0,
     (opts && opts.haze) || '#8fa6bd',
@@ -889,28 +1158,50 @@ export function drawShadow(ctx, camera, player, venue) {
   const base = venue && venue.shadowAlpha != null ? venue.shadowAlpha : 0.3;
   if (base <= 0.01) return;
 
-  // Airborne: the contact patch spreads and washes out with height.
+  // Airborne: the contact patch spreads and washes out with height, and lifts
+  // off the feet (drawn at the ground point while the figure rises with z).
   const lift = clamp(z / 1.6, 0, 1);
-  const rw = (0.36 + 0.34 * lift) * g.scale;
+  const rw = (0.36 + 0.40 * lift) * g.scale;
   const rh = rw * Math.max(0.12, Math.sin(camera.pitch));
   if (rw < 0.6) return;
+
+  // Anisotropy: a real shadow stretches along the ground away from the light.
+  // We take the screen light direction and elongate the ellipse along it, and
+  // nudge the whole patch a little to the shadow side. Softens with height.
+  let ldx = -0.34, ldy = -0.86;
+  if (venue) {
+    if (venue.floodlit) { ldx = -0.28; ldy = -0.96; }
+    else if (venue.timeOfDay === 'afternoon') { ldx = -0.64; ldy = -0.58; }
+  }
+  const lm = Math.hypot(ldx, ldy) || 1; ldx /= lm; ldy /= lm;
+  const rot = Math.atan2(ldy, ldx);
+  const stretch = 1 + (0.5 + 0.5 * lift) * (venue && (venue.indoor || venue.floodlit) ? 0.35 : 0.6);
+  const offMag = rw * 0.22 * (1 - lift);
+  const cx = g.x - ldx * offMag;                 // cast away from the light
+  const cy = g.y - ldy * offMag * Math.max(0.2, Math.sin(camera.pitch));
 
   const alpha = base * (1 - 0.62 * lift);
   const sharp = venue && (venue.indoor || venue.floodlit);
   const rings = sharp ? 2 : 3;
 
+  if (!(isFinite(cx) && isFinite(cy) && isFinite(rot) && rw > 0 && rh > 0)) return;
+
   ctx.save();
-  for (let i = rings; i >= 1; i--) {
-    const k = i / rings;
-    // Outer rings are bigger and much fainter — a cheap penumbra.
-    const spread = 1 + (k - 1 / rings) * (sharp ? 0.34 : 0.60);
-    ctx.globalAlpha = alpha * (1 / rings) * (sharp ? 1.15 : 1);
-    ctx.beginPath();
-    ctx.ellipse(g.x, g.y, rw * spread, rh * spread, 0, 0, TAU);
-    ctx.fillStyle = '#000';
-    ctx.fill();
+  try {
+    for (let i = rings; i >= 1; i--) {
+      const k = i / rings;
+      // Outer rings are bigger and much fainter — a cheap penumbra. The support
+      // foot (inner ring) stays tightest and darkest.
+      const spread = 1 + (k - 1 / rings) * (sharp ? 0.34 : 0.60);
+      ctx.globalAlpha = alpha * (1 / rings) * (sharp ? 1.15 : 1);
+      ctx.beginPath();
+      ctx.ellipse(cx, cy, rw * spread * stretch, rh * spread, rot, 0, TAU);
+      ctx.fillStyle = '#000';
+      ctx.fill();
+    }
+  } finally {
+    ctx.restore();
   }
-  ctx.restore();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -923,6 +1214,10 @@ function drawFigure(ctx, ox, oy, scale, avatar, st, fade, haze, tilt, alpha, lod
 
   buildPose(av, st);
 
+  // Non-finite origin/scale would poison every joint and reach a gradient
+  // constructor (which throws on NaN); bail before any drawing state is touched.
+  if (!(isFinite(ox) && isFinite(oy) && isFinite(scale) && scale > 0)) return;
+
   const facing = st.facing || 0;
   _ox = ox; _oy = oy; _sc = scale;
   _cf = Math.cos(facing);   // maps body-right → screen-x
@@ -931,12 +1226,15 @@ function drawFigure(ctx, ox, oy, scale, avatar, st, fade, haze, tilt, alpha, lod
   _tilt = tilt;
   _fadeStep = Math.round(clamp(fade, 0, 1) * FADE_STEPS);
   _haze = haze;
+  const hz = parseHex(haze);
+  _hzR = (hz >> 16) & 255; _hzG = (hz >> 8) & 255; _hzB = hz & 255;
 
   flatten();
 
   const figH = H * scale;
-  // LOD: below ~34 px the face and string bed are noise, below ~14 px even the
-  // limb taper stops reading, so we drop straight to a chunky silhouette.
+  // LOD ladder: below ~34 px the face, string bed, folds and AO are noise (LOD 0
+  // stays a cheap lit silhouette + rim); 34–90 px gets cylindrical shading + AO
+  // (LOD 1); above that the full cloth/self-shadow/specular treatment (LOD 2).
   const lod = lodOverride >= 0 ? lodOverride : (figH < 34 ? 0 : figH < 90 ? 1 : 2);
 
   // "front" > 0 means we are looking at the player's chest.
@@ -954,77 +1252,153 @@ function drawFigure(ctx, ox, oy, scale, avatar, st, fade, haze, tilt, alpha, lod
   const tb = M.torso * (H / 1.85) * scale;
 
   ctx.save();
-  if (alpha < 1) ctx.globalAlpha = alpha;
+  try {
+    if (alpha < 1) ctx.globalAlpha = clamp(alpha, 0, 1);
 
-  // Painter's order within the figure: whichever limb is further from the camera
-  // goes down first. Two comparisons, no sorting, no arrays.
-  const legFarIsD = depthOf(S.knD) > depthOf(S.knN);
-  const armFarIsD = depthOf(S.elD) > depthOf(S.elN);
+    // Painter's order within the figure: whichever limb is further from the camera
+    // goes down first. Two comparisons, no sorting, no arrays.
+    const legFarIsD = depthOf(S.knD) > depthOf(S.knN);
+    const armFarIsD = depthOf(S.elD) > depthOf(S.elN);
 
-  if (legFarIsD) { leg(ctx, true, 1, lb, skin, shorts, shoes); }
-  else { leg(ctx, false, 1, lb, skin, shorts, shoes); }
+    leg(ctx, legFarIsD, 1, lb, skin, shorts, shoes, lod);
 
-  if (armFarIsD && !M.bothHands) drawRacket(ctx, av, scale, lod);
-  if (armFarIsD) arm(ctx, true, 1, lb, skin, shirt, accent, av); else arm(ctx, false, 1, lb, skin, shirt, accent, av);
+    if (armFarIsD && !M.bothHands) drawRacket(ctx, av, scale, lod, st);
+    arm(ctx, armFarIsD, 1, lb, skin, shirt, accent, av, lod);
 
-  torso(ctx, tb, shirt, accent, shorts, lod, scale);
+    torso(ctx, tb, shirt, accent, shorts, lod, scale);
 
-  if (legFarIsD) { leg(ctx, false, 0, lb, skin, shorts, shoes); }
-  else { leg(ctx, true, 0, lb, skin, shorts, shoes); }
+    leg(ctx, !legFarIsD, 0, lb, skin, shorts, shoes, lod);
 
-  head(ctx, av, skin, hairC, hatC, accent, scale, front, lod);
+    // Near arm casts a soft shadow onto the chest before the head/near arm land.
+    if (lod >= 2) selfShadow(ctx, armFarIsD, lb);
 
-  if (armFarIsD) arm(ctx, false, 0, lb, skin, shirt, accent, av);
-  else arm(ctx, true, 0, lb, skin, shirt, accent, av);
+    head(ctx, av, skin, hairC, hatC, accent, scale, front, lod, st);
 
-  if (!(armFarIsD && !M.bothHands)) drawRacket(ctx, av, scale, lod);
+    arm(ctx, !armFarIsD, 0, lb, skin, shirt, accent, av, lod);
 
-  ctx.restore();
+    if (!(armFarIsD && !M.bothHands)) drawRacket(ctx, av, scale, lod, st);
+  } finally {
+    ctx.restore();
+  }
+}
+
+/**
+ * Soft self-shadow of the near arm onto the torso, clipped to the shirt path so
+ * it never spills past the silhouette. Cheap: one clipped AO blob.
+ */
+function selfShadow(ctx, armFarIsD, lb) {
+  const nearIsDom = !armFarIsD;
+  const el = nearIsDom ? S.elD : S.elN;
+  const sh = nearIsDom ? S.shD : S.shN;
+  // Only shadow when the arm is actually in front of / across the chest.
+  const cx = (sh.x + el.x) * 0.5, cy = (sh.y + el.y) * 0.5;
+  ctx.save();
+  try {
+    torsoPath(ctx);
+    ctx.clip();
+    aoBlob(ctx, cx, cy, 0.34 * lb, 0.5 * lb, 0.4);
+  } finally {
+    ctx.restore();
+  }
 }
 
 /** shadeIdx 0 = near limb (lit), 1 = far limb (in the body's own shade). */
-function leg(ctx, isDom, shadeIdx, lb, skin, shorts, shoes) {
+function leg(ctx, isDom, shadeIdx, lb, skin, shorts, shoes, lod) {
   const hp = isDom ? S.hpD : S.hpN;
   const kn = isDom ? S.knD : S.knN;
   const ft = isDom ? S.ftD : S.ftN;
   const toe = isDom ? S.toeD : S.toeN;
 
-  const sk = col(skin, shadeIdx);
-  const sh = col(shorts, shadeIdx);
-
   // Shorts cover the top ~45 % of the thigh.
   const mx = hp.x + (kn.x - hp.x) * 0.45;
   const my = hp.y + (kn.y - hp.y) * 0.45;
-  taper(ctx, mx, my, 0.072 * lb, kn.x, kn.y, 0.058 * lb, sk);
-  taper(ctx, kn.x, kn.y, 0.056 * lb, ft.x, ft.y, 0.038 * lb, sk);
-  taper(ctx, hp.x, hp.y, 0.098 * lb, mx, my, 0.082 * lb, sh);
 
-  // Shoe: a flat wedge from the ankle to the toe.
-  const so = col(shoes, shadeIdx);
-  taper(ctx, ft.x, ft.y, 0.046 * lb, toe.x, toe.y, 0.032 * lb, so);
+  if (lod === 0) {
+    const sk = col(skin, shadeIdx), sh = col(shorts, shadeIdx);
+    taper(ctx, mx, my, 0.072 * lb, kn.x, kn.y, 0.058 * lb, sk);
+    taper(ctx, kn.x, kn.y, 0.056 * lb, ft.x, ft.y, 0.038 * lb, sk);
+    taper(ctx, hp.x, hp.y, 0.098 * lb, mx, my, 0.082 * lb, sh);
+    taper(ctx, ft.x, ft.y, 0.046 * lb, toe.x, toe.y, 0.032 * lb, col(shoes, shadeIdx));
+    return;
+  }
+
+  // Thigh (build-scaled bulge), shin taper, then the shorts panel over the top.
+  const bulge = 0.008 * (M.limb - 1);
+  litTaper(ctx, mx, my, (0.072 + bulge) * lb, kn.x, kn.y, 0.056 * lb, skin, shadeIdx);
+  litTaper(ctx, kn.x, kn.y, 0.054 * lb, ft.x, ft.y, 0.038 * lb, skin, shadeIdx);
+  litTaper(ctx, hp.x, hp.y, (0.098 + bulge) * lb, mx, my, (0.082 + bulge) * lb, shorts, shadeIdx);
+
+  // AO where the thigh meets the shin (behind the knee) and under the shorts hem.
+  if (lod >= 1 && shadeIdx === 0) {
+    aoBlob(ctx, kn.x, kn.y, 0.05 * lb, 0.05 * lb, 0.35);
+    aoBlob(ctx, mx, my, 0.08 * lb, 0.045 * lb, 0.4);
+  }
+
+  shoe(ctx, ft, toe, lb, shoes, shadeIdx, lod);
 }
 
-function arm(ctx, isDom, shadeIdx, lb, skin, shirt, accent, av) {
+/** Shoe with sole, midsole stripe and a lit toe box. */
+function shoe(ctx, ft, toe, lb, shoes, shadeIdx, lod) {
+  litTaper(ctx, ft.x, ft.y, 0.046 * lb, toe.x, toe.y, 0.030 * lb, shoes, shadeIdx);
+  if (lod < 1) return;
+  const dx = toe.x - ft.x, dy = toe.y - ft.y;
+  const d = Math.hypot(dx, dy);
+  if (d < 1e-3) return;
+  const ux = dx / d, uy = dy / d;
+  // Sole: a thin dark wedge just under the shoe.
+  const soleC = tint(shoes, 2, _fadeStep, _haze);
+  taper(ctx, ft.x + uy * 0.028 * lb, ft.y - ux * 0.028 * lb + 0.014 * lb, 0.02 * lb,
+    toe.x + uy * 0.02 * lb, toe.y - ux * 0.02 * lb + 0.012 * lb, 0.014 * lb, soleC);
+  // Midsole stripe.
+  if (lod >= 2) {
+    ctx.save();
+    try {
+      ctx.strokeStyle = tint(shoes, 1, _fadeStep, _haze);
+      ctx.lineWidth = Math.max(0.6, 0.012 * lb);
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(ft.x + ux * 0.02 * lb, ft.y + uy * 0.02 * lb + 0.006 * lb);
+      ctx.lineTo(toe.x - ux * 0.02 * lb, toe.y - uy * 0.02 * lb + 0.006 * lb);
+      ctx.stroke();
+    } finally { ctx.restore(); }
+  }
+}
+
+function arm(ctx, isDom, shadeIdx, lb, skin, shirt, accent, av, lod) {
   const sh = isDom ? S.shD : S.shN;
   const el = isDom ? S.elD : S.elN;
   const hn = isDom ? S.hnD : S.hnN;
 
-  const sk = col(skin, shadeIdx);
   // Sleeve ends ~40 % down the upper arm.
   const mx = sh.x + (el.x - sh.x) * 0.42;
   const my = sh.y + (el.y - sh.y) * 0.42;
+  const bulge = 0.006 * (M.limb - 1);         // bicep/forearm mass from build
 
-  taper(ctx, mx, my, 0.048 * lb, el.x, el.y, 0.040 * lb, sk);
-  taper(ctx, el.x, el.y, 0.038 * lb, hn.x, hn.y, 0.028 * lb, sk);
-  taper(ctx, sh.x, sh.y, 0.066 * lb, mx, my, 0.056 * lb, col(shirt, shadeIdx));
+  if (lod === 0) {
+    const sk = col(skin, shadeIdx);
+    taper(ctx, mx, my, 0.048 * lb, el.x, el.y, 0.040 * lb, sk);
+    taper(ctx, el.x, el.y, 0.038 * lb, hn.x, hn.y, 0.028 * lb, sk);
+    taper(ctx, sh.x, sh.y, 0.066 * lb, mx, my, 0.056 * lb, col(shirt, shadeIdx));
+    disc(ctx, hn.x, hn.y, 0.033 * lb, sk);
+    return;
+  }
+
+  litTaper(ctx, mx, my, (0.048 + bulge) * lb, el.x, el.y, 0.038 * lb, skin, shadeIdx);
+  litTaper(ctx, el.x, el.y, (0.038 + bulge) * lb, hn.x, hn.y, 0.027 * lb, skin, shadeIdx);
+  litTaper(ctx, sh.x, sh.y, (0.066 + bulge) * lb, mx, my, (0.056 + bulge) * lb, shirt, shadeIdx);
+
+  // AO at the elbow crook and where the sleeve meets the deltoid.
+  if (lod >= 1 && shadeIdx === 0) {
+    aoBlob(ctx, el.x, el.y, 0.04 * lb, 0.04 * lb, 0.3);
+    aoBlob(ctx, mx, my, 0.05 * lb, 0.05 * lb, 0.28);
+  }
 
   if (av.wristbands) {
-    // Wristband sits just proximal to the hand, on the forearm axis.
     const wx = hn.x + (el.x - hn.x) * 0.16;
     const wy = hn.y + (el.y - hn.y) * 0.16;
-    disc(ctx, wx, wy, 0.040 * lb, col(accent, shadeIdx));
+    litDisc(ctx, wx, wy, 0.040 * lb, accent, shadeIdx);
   }
-  disc(ctx, hn.x, hn.y, 0.033 * lb, sk);
+  litDisc(ctx, hn.x, hn.y, 0.032 * lb, skin, shadeIdx);
 }
 
 /**
@@ -1038,11 +1412,13 @@ function arm(ctx, isDom, shadeIdx, lb, skin, shirt, accent, av) {
  * instead of collapsing to a line — the floor is always narrower than a
  * square-on torso, so it can never look wider from the side than from the front.
  */
-function torso(ctx, tb, shirt, accent, shorts, lod, scale) {
+// Torso outline geometry, resolved from the projected shoulders/hips. Shared by
+// torso() and by the self-shadow clip so both use the identical silhouette.
+const _T = { shx: 0, shy: 0, hix: 0, hiy: 0, sdx: 0, sdy: 0, hdx: 0, hdy: 0, wx: 0, wy: 0, wdx: 0, wdy: 0 };
+
+function torsoGeom(scale) {
   const shx = (S.shD.x + S.shN.x) * 0.5, shy = (S.shD.y + S.shN.y) * 0.5;
   const hix = (S.hpD.x + S.hpN.x) * 0.5, hiy = (S.hpD.y + S.hpN.y) * 0.5;
-
-  // Half-width vectors (centre → the player's dominant side).
   let sdx = (S.shD.x - S.shN.x) * 0.5, sdy = (S.shD.y - S.shN.y) * 0.5;
   let hdx = (S.hpD.x - S.hpN.x) * 0.5, hdy = (S.hpD.y - S.hpN.y) * 0.5;
 
@@ -1053,21 +1429,45 @@ function torso(ctx, tb, shirt, accent, shorts, lod, scale) {
   l = Math.sqrt(hdx * hdx + hdy * hdy);
   if (l < hMin) { if (l < 1e-3) { hdx = hMin; hdy = 0; } else { const k = hMin / l; hdx *= k; hdy *= k; } }
 
-  // Waist sits 55 % of the way down and pinches to ~88 % of the mean width.
-  const wx = shx + (hix - shx) * 0.55, wy = shy + (hiy - shy) * 0.55;
-  const wdx = (sdx + hdx) * 0.44, wdy = (sdy + hdy) * 0.44;
+  _T.shx = shx; _T.shy = shy; _T.hix = hix; _T.hiy = hiy;
+  _T.sdx = sdx; _T.sdy = sdy; _T.hdx = hdx; _T.hdy = hdy;
+  _T.wx = shx + (hix - shx) * 0.55; _T.wy = shy + (hiy - shy) * 0.55;
+  _T.wdx = (sdx + hdx) * 0.44; _T.wdy = (sdy + hdy) * 0.44;
+}
 
+/** Build the shirt outline path (no fill). Uses the last torsoGeom() result. */
+function torsoPath(ctx) {
   ctx.beginPath();
-  ctx.moveTo(shx - sdx, shy - sdy);
-  ctx.quadraticCurveTo(wx - wdx, wy - wdy, hix - hdx, hiy - hdy);
-  ctx.lineTo(hix + hdx, hiy + hdy);
-  ctx.quadraticCurveTo(wx + wdx, wy + wdy, shx + sdx, shy + sdy);
+  ctx.moveTo(_T.shx - _T.sdx, _T.shy - _T.sdy);
+  ctx.quadraticCurveTo(_T.wx - _T.wdx, _T.wy - _T.wdy, _T.hix - _T.hdx, _T.hiy - _T.hdy);
+  ctx.lineTo(_T.hix + _T.hdx, _T.hiy + _T.hdy);
+  ctx.quadraticCurveTo(_T.wx + _T.wdx, _T.wy + _T.wdy, _T.shx + _T.sdx, _T.shy + _T.sdy);
   ctx.closePath();
-  ctx.fillStyle = col(shirt, 0);
-  ctx.fill();
+}
 
-  // Shorts: a band across the pelvis. The thigh sections are drawn by leg(), so
-  // together they form the leg holes without any clipping work.
+function torso(ctx, tb, shirt, accent, shorts, lod, scale) {
+  torsoGeom(scale);
+  const { shx, shy, hix, hiy, sdx, sdy, hdx, hdy } = _T;
+
+  // Shirt: filled with a gradient across the shoulder axis, so the volume
+  // highlight sits on whichever side faces the light and slides as the torso
+  // turns. One gradient per torso (not per limb) — cheap enough to build fresh.
+  torsoPath(ctx);
+  if (lod === 0) {
+    ctx.fillStyle = col(shirt, 0);
+    ctx.fill();
+  } else {
+    let ax = sdx, ay = sdy;
+    const al = Math.hypot(ax, ay) || 1; ax /= al; ay /= al;
+    const s = _L.dx * ax + _L.dy * ay;
+    const W = Math.max(2, al * 1.08);
+    const g = ctx.createLinearGradient(shx - ax * W, shy - ay * W, shx + ax * W, shy + ay * W);
+    addCylStops(g, parseHex(shirt), 0, s);
+    ctx.fillStyle = g;
+    ctx.fill();
+  }
+
+  // Shorts: a band across the pelvis, shaded across the hips.
   const drop = 0.075 * M.H * scale;
   ctx.beginPath();
   ctx.moveTo(hix - hdx * 1.04, hiy - hdy * 1.04);
@@ -1075,28 +1475,73 @@ function torso(ctx, tb, shirt, accent, shorts, lod, scale) {
   ctx.lineTo(hix + hdx * 0.98, hiy + hdy * 0.98 + drop);
   ctx.lineTo(hix - hdx * 0.98, hiy - hdy * 0.98 + drop);
   ctx.closePath();
-  ctx.fillStyle = col(shorts, 0);
-  ctx.fill();
+  if (lod === 0) {
+    ctx.fillStyle = col(shorts, 0);
+    ctx.fill();
+  } else {
+    let hx2 = hdx, hy2 = hdy;
+    const hl = Math.hypot(hx2, hy2) || 1; hx2 /= hl; hy2 /= hl;
+    const s2 = _L.dx * hx2 + _L.dy * hy2;
+    const W2 = Math.max(2, hl * 1.05);
+    const g2 = ctx.createLinearGradient(hix - hx2 * W2, hiy - hy2 * W2, hix + hx2 * W2, hiy + hy2 * W2);
+    addCylStops(g2, parseHex(shorts), 0, s2);
+    ctx.fillStyle = g2;
+    ctx.fill();
+  }
 
   if (lod >= 1) {
-    // Accent chevron across the chest, aligned to the shoulder axis so it tilts
-    // with the torso instead of staying stubbornly horizontal.
+    // Ambient occlusion: armpit hollows and the waist crease, clipped to the shirt.
     ctx.save();
-    ctx.strokeStyle = col(accent, 0);
-    ctx.lineWidth = Math.max(1, 0.055 * tb);
-    ctx.lineCap = 'round';
-    ctx.lineJoin = 'round';
-    const dnx = (hix - shx) * 0.30, dny = (hiy - shy) * 0.30;
-    ctx.beginPath();
-    ctx.moveTo(shx - sdx * 0.86 + dnx * 0.6, shy - sdy * 0.86 + dny * 0.6);
-    ctx.lineTo(shx + dnx * 1.5, shy + dny * 1.5);
-    ctx.lineTo(shx + sdx * 0.86 + dnx * 0.6, shy + sdy * 0.86 + dny * 0.6);
-    ctx.stroke();
-    ctx.restore();
+    try {
+      torsoPath(ctx);
+      ctx.clip();
+      aoBlob(ctx, shx - sdx * 0.9, shy - sdy * 0.9 + tb * 0.1, 0.5 * tb, 0.7 * tb, 0.32);
+      aoBlob(ctx, shx + sdx * 0.9, shy + sdy * 0.9 + tb * 0.1, 0.5 * tb, 0.7 * tb, 0.32);
+      aoBlob(ctx, _T.wx, _T.wy, Math.hypot(sdx, sdy) * 1.1, tb * 0.5, 0.24);
+    } finally { ctx.restore(); }
+  }
+
+  if (lod >= 2) {
+    // Cloth folds: a couple of curved lines from the shoulders toward the waist,
+    // bunching on the compressed side of the current lean/turn.
+    ctx.save();
+    try {
+      torsoPath(ctx);
+      ctx.clip();
+      ctx.strokeStyle = 'rgba(0,0,0,0.10)';
+      ctx.lineWidth = Math.max(0.6, 0.03 * tb);
+      ctx.lineCap = 'round';
+      const cnx = (hix - shx), cny = (hiy - shy);
+      for (let i = -1; i <= 1; i += 2) {
+        const ox2 = sdx * 0.5 * i, oy2 = sdy * 0.5 * i;
+        ctx.beginPath();
+        ctx.moveTo(shx + ox2 * 1.2, shy + oy2 * 1.2 + tb * 0.2);
+        ctx.quadraticCurveTo(_T.wx + ox2 * 0.6 - cnx * 0.05, _T.wy + oy2 * 0.6,
+          _T.wx + ox2 * 0.2, _T.wy + oy2 * 0.2 + tb * 0.2);
+        ctx.stroke();
+      }
+    } finally { ctx.restore(); }
+  }
+
+  if (lod >= 1) {
+    // Accent chevron as a shaded panel, aligned to the shoulder axis.
+    ctx.save();
+    try {
+      ctx.strokeStyle = tint(accent, _L.dy < -0.5 ? 0 : 1, _fadeStep, _haze);
+      ctx.lineWidth = Math.max(1, 0.055 * tb);
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      const dnx = (hix - shx) * 0.30, dny = (hiy - shy) * 0.30;
+      ctx.beginPath();
+      ctx.moveTo(shx - sdx * 0.86 + dnx * 0.6, shy - sdy * 0.86 + dny * 0.6);
+      ctx.lineTo(shx + dnx * 1.5, shy + dny * 1.5);
+      ctx.lineTo(shx + sdx * 0.86 + dnx * 0.6, shy + sdy * 0.86 + dny * 0.6);
+      ctx.stroke();
+    } finally { ctx.restore(); }
   }
 }
 
-function head(ctx, av, skin, hairC, hatC, accent, scale, front, lod) {
+function head(ctx, av, skin, hairC, hatC, accent, scale, front, lod, st) {
   const R = M.headR * scale;
   const hx = S.head.x, hy = S.head.y;
 
@@ -1116,33 +1561,46 @@ function head(ctx, av, skin, hairC, hatC, accent, scale, front, lod) {
   // whichever way the player is turned.
   const faceA = Math.atan2(ffy + R * 0.85, ffx);
 
+  const useLit = lod >= 1;
   const sk = col(skin, 0);
   const hc = col(hairC, 0);
   const hcD = col(hairC, 1);
+  const hcHi = tint(hairC, 0, _fadeStep, _haze);   // highlight uses the lit tier
   const style = av.hairStyle || 'bald';
+
+  // Long hair swings and lags behind the head with lateral movement.
+  const vx = (st && st.vx) || 0, vy = (st && st.vy) || 0;
+  const spd = Math.hypot(vx, vy);
+  const sway = clamp((vx * _dom) / PLAYER.MAX_SPEED, -1, 1) * R * 0.6
+    + clamp(spd / PLAYER.MAX_SPEED, 0, 1) * R * 0.12;
 
   // Neck, drawn here so it lands over the shirt collar but under the head.
   const shx = (S.shD.x + S.shN.x) * 0.5;
   const shy = (S.shD.y + S.shN.y) * 0.5;
-  taper(ctx, shx, shy, R * 0.50, S.neck.x, S.neck.y, R * 0.42, col(skin, 1));
+  if (useLit) litTaper(ctx, shx, shy, R * 0.50, S.neck.x, S.neck.y, R * 0.42, skin, 1);
+  else taper(ctx, shx, shy, R * 0.50, S.neck.x, S.neck.y, R * 0.42, col(skin, 1));
 
-  // Hair mass that belongs BEHIND the skull, so it draws first. How much of it
-  // is visible depends on which way the player is turned: from the front, long
-  // hair falls behind the shoulders and only a fringe of it shows past the jaw.
+  // Hair mass that belongs BEHIND the skull, so it draws first.
   const vis = 0.28 + 0.72 * backness;
   if (style === 'medium' || style === 'long') {
     const drop = (style === 'long' ? R * 2.1 : R * 1.0) * vis;
     const wide = (style === 'long' ? R * 1.05 : R * 0.94) * (0.82 + 0.18 * backness);
-    taper(ctx, hx - ffx * 0.35, hy - ffy * 0.35 + R * 0.12, wide,
-      hx - ffx * 0.55, hy - ffy * 0.55 + drop, wide * 0.78, hcD);
+    const tx = hx - ffx * 0.55 + sway, ty = hy - ffy * 0.55 + drop;
+    if (useLit) litTaper(ctx, hx - ffx * 0.35, hy - ffy * 0.35 + R * 0.12, wide, tx, ty, wide * 0.78, hairC, 1);
+    else taper(ctx, hx - ffx * 0.35, hy - ffy * 0.35 + R * 0.12, wide, tx, ty, wide * 0.78, hcD);
   } else if (style === 'ponytail') {
     const bx = hx - ffx * 0.75, by = hy - ffy * 0.75;
-    taper(ctx, bx, by, R * 0.32, bx - ffx * 0.40, by + R * 1.6 * vis, R * 0.18, hcD);
+    const tx = bx - ffx * 0.40 + sway, ty = by + R * 1.6 * vis;
+    if (useLit) litTaper(ctx, bx, by, R * 0.32, tx, ty, R * 0.18, hairC, 1);
+    else taper(ctx, bx, by, R * 0.32, tx, ty, R * 0.18, hcD);
   } else if (style === 'bun') {
-    disc(ctx, hx - ffx * 0.85, hy - ffy * 0.85 - R * 0.42, R * 0.44, hcD);
+    if (useLit) litDisc(ctx, hx - ffx * 0.85, hy - ffy * 0.85 - R * 0.42, R * 0.44, hairC, 1);
+    else disc(ctx, hx - ffx * 0.85, hy - ffy * 0.85 - R * 0.42, R * 0.44, hcD);
   }
 
-  disc(ctx, hx, hy, R, sk);
+  // Spherical skull.
+  if (useLit) litDisc(ctx, hx, hy, R, skin, 0);
+  else disc(ctx, hx, hy, R, sk);
 
   if (style !== 'bald') {
     // The gap closes completely as we swing round behind the player, so the back
@@ -1155,8 +1613,22 @@ function head(ctx, av, skin, hairC, hatC, accent, scale, front, lod) {
     if (gap < 0.02) ctx.arc(hx, hy, rr, 0, TAU);
     else ctx.arc(hx, hy, rr, faceA + gap, faceA - gap + TAU);
     ctx.closePath();
-    ctx.fillStyle = hc;
+    ctx.fillStyle = hcD;
     ctx.fill();
+
+    // Hair volume: a highlight crescent on the light side over the darker mass.
+    if (lod >= 1 && style !== 'buzz') {
+      const lang = Math.atan2(_L.dy, _L.dx);
+      ctx.save();
+      try {
+        ctx.beginPath();
+        ctx.arc(hx + _L.dx * R * 0.12, hy + _L.dy * R * 0.12, rr * 0.98, lang - 1.0, lang + 1.0);
+        ctx.strokeStyle = hcHi;
+        ctx.lineWidth = Math.max(1, R * 0.34);
+        ctx.lineCap = 'round';
+        ctx.stroke();
+      } finally { ctx.restore(); }
+    }
 
     if (style === 'curly' && lod >= 1) {
       for (let i = 0; i < 5; i++) {
@@ -1195,14 +1667,21 @@ function head(ctx, av, skin, hairC, hatC, accent, scale, front, lod) {
       // Pushing the canvas through that plane's 2x2 matrix means a circle drawn
       // there projects to the correct ellipse for free: wide from the front, a
       // jutting sliver in profile.
-      ctx.save();
-      ctx.translate(hx, hy - R * 0.18);
-      ctx.transform(rrx, rry, ffx, ffy, 0, 0);
-      ctx.beginPath();
-      ctx.ellipse(0, 0.62, 0.98, 0.62, 0, 0, TAU);
-      ctx.fillStyle = hcolD;
-      ctx.fill();
-      ctx.restore();
+      // The brim is a flat disc in the body's (right, forward) plane. Guard the
+      // 2x2 against non-finite / near-singular values before touching the matrix.
+      const det = rrx * ffy - rry * ffx;
+      if (isFinite(rrx) && isFinite(rry) && isFinite(ffx) && isFinite(ffy)
+        && isFinite(hx) && isFinite(hy) && Math.abs(det) > 1e-4) {
+        ctx.save();
+        try {
+          ctx.translate(hx, hy - R * 0.18);
+          ctx.transform(rrx, rry, ffx, ffy, 0, 0);
+          ctx.beginPath();
+          ctx.ellipse(0, 0.62, 0.98, 0.62, 0, 0, TAU);
+          ctx.fillStyle = hcolD;
+          ctx.fill();
+        } finally { ctx.restore(); }
+      }
 
       if (hat === 'visor') {
         ctx.save();
@@ -1238,7 +1717,7 @@ function head(ctx, av, skin, hairC, hatC, accent, scale, front, lod) {
   }
 }
 
-function drawRacket(ctx, av, scale, lod) {
+function drawRacket(ctx, av, scale, lod, st) {
   const frame = RACKET_FRAMES[av.racketFrame] || RACKET_FRAMES.graphite;
   const gripC = col(av.racketColor || '#101317', 0);
   const frameC = col(frame.frame, 0);
@@ -1247,77 +1726,137 @@ function drawRacket(ctx, av, scale, lod) {
   const tx = S.rkTip.x, ty = S.rkTip.y;
   const dx = tx - bx, dy = ty - by;
   const len = Math.sqrt(dx * dx + dy * dy);
-  if (len < 1.5) return;
+  if (!(len >= 1.5) || !isFinite(S.rkMid.x) || !isFinite(S.rkMid.y)) return;
 
   const ang = Math.atan2(dy, dx);
+  if (!isFinite(ang)) return;
   const w = Math.max(1, 0.016 * scale);   // ~1.6 cm of frame stock
 
-  // Handle: butt → throat.
-  taper(ctx, bx, by, w * 1.5, S.rkThroat.x, S.rkThroat.y, w * 1.1, gripC);
+  // Handle: butt → throat, with a lit overwrap.
+  if (lod >= 1) litTaper(ctx, bx, by, w * 1.5, S.rkThroat.x, S.rkThroat.y, w * 1.1, av.racketColor || '#101317', 0);
+  else taper(ctx, bx, by, w * 1.5, S.rkThroat.x, S.rkThroat.y, w * 1.1, gripC);
+  if (lod >= 2) {
+    // Overwrap: a couple of diagonal ticks along the grip.
+    const gux = (S.rkThroat.x - bx) / (RK_THROAT), guy = (S.rkThroat.y - by) / (RK_THROAT);
+    ctx.save();
+    try {
+      ctx.strokeStyle = 'rgba(0,0,0,0.25)';
+      ctx.lineWidth = Math.max(0.5, w * 0.2);
+      const gpx = -Math.sin(ang), gpy = Math.cos(ang);
+      for (let i = 1; i <= 3; i++) {
+        const t = i / 4;
+        const cxg = bx + (S.rkThroat.x - bx) * t * RK_GRIP_HOLD * 6;
+        const cyg = by + (S.rkThroat.y - by) * t * RK_GRIP_HOLD * 6;
+        ctx.beginPath();
+        ctx.moveTo(cxg + gpx * w, cyg + gpy * w);
+        ctx.lineTo(cxg - gpx * w, cyg - gpy * w);
+        ctx.stroke();
+      }
+    } finally { ctx.restore(); }
+  }
 
-  // Head. The projected shaft length already carries the foreshortening of the
-  // long axis; the short axis is foreshortened separately by faceOpen, which the
-  // pose animates from edge-on (takeback) to square (contact).
+  // Head. The projected shaft length carries the long-axis foreshortening; the
+  // short axis is squashed by faceOpen (edge-on takeback → square at contact).
   const semiA = len * (RK_HEAD_LEN * 0.5 / RK_LEN);
   const semiB = Math.max(w * 1.2, RK_HEAD_W * 0.5 * scale * M.faceOpen);
 
-  ctx.save();
-  ctx.translate(S.rkMid.x, S.rkMid.y);
-  ctx.rotate(ang);
+  // Motion blur through the fast part of a swing/serve/smash.
+  const state = st && st.state;
+  const phase = clamp((st && st.phase) || 0, 0, 1);
+  let blur = 0;
+  if (state === 'swing') blur = Math.sin(phase * Math.PI);
+  else if (state === 'serve_hit' || state === 'smash') blur = Math.sin(clamp(phase, 0, 1) * Math.PI * 0.5) > 0.6 ? 1 : 0;
+  else if (state === 'volley') blur = 0;
 
-  if (lod >= 1) {
-    // String bed: a translucent fill plus a couple of guide lines. Cheap, and it
-    // stops the head reading as a solid paddle.
-    ctx.beginPath();
-    ctx.ellipse(0, 0, semiA - w, semiB - w * 0.5, 0, 0, TAU);
-    ctx.fillStyle = 'rgba(240,244,248,0.16)';
-    ctx.fill();
-    if (lod >= 2 && semiB > 3) {
-      ctx.strokeStyle = 'rgba(235,240,246,0.35)';
-      ctx.lineWidth = Math.max(0.5, w * 0.22);
+  ctx.save();
+  try {
+    ctx.translate(S.rkMid.x, S.rkMid.y);
+    ctx.rotate(ang);
+
+    // Motion-blur ghosts: draw the frame ellipse a couple of times, offset back
+    // along the swing arc, faint. Kept before the solid frame so it sits behind.
+    if (blur > 0.2 && lod >= 1) {
+      ctx.save();
+      try {
+        for (let i = 1; i <= 2; i++) {
+          ctx.globalAlpha = 0.16 * blur / i;
+          const off = -i * semiB * 0.9 * blur;
+          ctx.beginPath();
+          ctx.ellipse(0, off, semiA, semiB, 0, 0, TAU);
+          ctx.strokeStyle = frameC;
+          ctx.lineWidth = w * 1.4;
+          ctx.stroke();
+        }
+      } finally { ctx.restore(); }
+    }
+
+    if (lod >= 1) {
+      // String bed.
       ctx.beginPath();
-      for (let i = -1; i <= 1; i++) {
-        const yy = (semiB - w) * i * 0.55;
-        ctx.moveTo(-semiA + w, yy); ctx.lineTo(semiA - w, yy);
+      ctx.ellipse(0, 0, Math.max(0.5, semiA - w), Math.max(0.5, semiB - w * 0.5), 0, 0, TAU);
+      ctx.fillStyle = 'rgba(240,244,248,0.16)';
+      ctx.fill();
+      if (lod >= 2 && semiB > 3) {
+        ctx.strokeStyle = 'rgba(235,240,246,0.35)';
+        ctx.lineWidth = Math.max(0.5, w * 0.22);
+        ctx.beginPath();
+        for (let i = -1; i <= 1; i++) {
+          const yy = (semiB - w) * i * 0.55;
+          ctx.moveTo(-semiA + w, yy); ctx.lineTo(semiA - w, yy);
+        }
+        for (let i = -2; i <= 2; i++) {
+          const xx = (semiA - w) * i * 0.38;
+          ctx.moveTo(xx, -semiB + w); ctx.lineTo(xx, semiB - w);
+        }
+        ctx.stroke();
       }
-      for (let i = -2; i <= 2; i++) {
-        const xx = (semiA - w) * i * 0.38;
-        ctx.moveTo(xx, -semiB + w); ctx.lineTo(xx, semiB - w);
-      }
+    }
+
+    // Frame: metallic cross-gradient (dark rim → bright centre → dark rim).
+    let fstroke = frameC;
+    if (lod >= 1 && semiB > 2) {
+      const fi = parseHex(frame.frame);
+      const g = ctx.createLinearGradient(0, -semiB, 0, semiB);
+      const lo = 'rgb(' + (((fi >> 16) & 255) * 0.55 | 0) + ',' + (((fi >> 8) & 255) * 0.55 | 0) + ',' + ((fi & 255) * 0.55 | 0) + ')';
+      const hi = frame.gloss > 0.4
+        ? 'rgb(' + Math.min(255, ((fi >> 16) & 255) + 150) + ',' + Math.min(255, ((fi >> 8) & 255) + 150) + ',' + Math.min(255, (fi & 255) + 150) + ')'
+        : frameC;
+      g.addColorStop(0, lo); g.addColorStop(0.5, hi); g.addColorStop(1, lo);
+      fstroke = g;
+    }
+    ctx.beginPath();
+    ctx.ellipse(0, 0, semiA, semiB, 0, 0, TAU);
+    ctx.strokeStyle = fstroke;
+    ctx.lineWidth = w * 1.6;
+    ctx.stroke();
+
+    // Specular glint on the frame's light-facing shoulder.
+    if (frame.gloss > 0.3 && lod >= 2) {
+      ctx.beginPath();
+      ctx.ellipse(0, 0, semiA, semiB, 0, Math.PI * 1.15, Math.PI * 1.6);
+      ctx.strokeStyle = 'rgba(255,255,255,' + (frame.gloss * 0.6).toFixed(2) + ')';
+      ctx.lineWidth = w * 0.6;
       ctx.stroke();
     }
+  } finally {
+    ctx.restore();
   }
 
-  ctx.beginPath();
-  ctx.ellipse(0, 0, semiA, semiB, 0, 0, TAU);
-  ctx.strokeStyle = frameC;
-  ctx.lineWidth = w * 1.6;
-  ctx.stroke();
-
-  if (frame.gloss > 0.4 && lod >= 2) {
-    ctx.beginPath();
-    ctx.ellipse(0, 0, semiA, semiB, 0, Math.PI * 1.15, Math.PI * 1.75);
-    ctx.strokeStyle = 'rgba(255,255,255,' + (frame.gloss * 0.5).toFixed(2) + ')';
-    ctx.lineWidth = w * 0.6;
-    ctx.stroke();
-  }
-  ctx.restore();
-
-  // Throat struts: two lines from the throat to the sides of the head, which is
-  // the detail that makes a racket read as a racket rather than a lollipop.
+  // Throat struts.
   if (lod >= 1) {
     const nx = -Math.sin(ang), ny = Math.cos(ang);
     const jx = S.rkMid.x - Math.cos(ang) * semiA * 0.92;
     const jy = S.rkMid.y - Math.sin(ang) * semiA * 0.92;
     ctx.save();
-    ctx.strokeStyle = frameC;
-    ctx.lineWidth = w * 1.2;
-    ctx.beginPath();
-    ctx.moveTo(S.rkThroat.x, S.rkThroat.y);
-    ctx.lineTo(jx + nx * semiB * 0.75, jy + ny * semiB * 0.75);
-    ctx.moveTo(S.rkThroat.x, S.rkThroat.y);
-    ctx.lineTo(jx - nx * semiB * 0.75, jy - ny * semiB * 0.75);
-    ctx.stroke();
-    ctx.restore();
+    try {
+      ctx.strokeStyle = frameC;
+      ctx.lineWidth = w * 1.2;
+      ctx.beginPath();
+      ctx.moveTo(S.rkThroat.x, S.rkThroat.y);
+      ctx.lineTo(jx + nx * semiB * 0.75, jy + ny * semiB * 0.75);
+      ctx.moveTo(S.rkThroat.x, S.rkThroat.y);
+      ctx.lineTo(jx - nx * semiB * 0.75, jy - ny * semiB * 0.75);
+      ctx.stroke();
+    } finally { ctx.restore(); }
   }
 }
